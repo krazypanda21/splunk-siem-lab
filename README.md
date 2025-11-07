@@ -36,6 +36,9 @@ Each attack is simulated using Kali Linux and monitored through Ubuntu Server lo
 
 ## Folder Structure
 
+## Folder Structure
+
+```text
 docs/
  ├── attacks/
  │   ├── brute_force.md
@@ -48,8 +51,7 @@ docs/
  └── alert_results.md
 config/
 setup/
-
-
+```
 
 
 ---
