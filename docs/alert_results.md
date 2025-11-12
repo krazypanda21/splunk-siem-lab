@@ -20,6 +20,8 @@ index=main source="/var/log/auth.log" "Failed password"
 | stats count AS fail_count BY src_ip, user, _time
 | where fail_count >= 10
 | sort - fail_count
+| eval alert_name="SSH Brute Force", severity=case(fail_count>=50,"Critical", fail_count>=30,"High", fail_count>=10,"Medium")
+| collect index=main source="alert:ssh_bruteforce"
 
 ```
 
@@ -83,16 +85,13 @@ Exclude trusted IPs, adjust thresholds for VPN/jump-boxes, run every 5 minutes
 
 ## SPL
 ```
-index=main (source="/var/log/kern.log" OR source="/var/log/syslog")
-| rex "SRC=(?<src_ip>\d{1,3}(?:\.\d{1,3}){3})"
-| rex "DST=(?<dst_ip>\d{1,3}(?:\.\d{1,3}){3})"
-| rex "SPT=(?<spt>\d+)" | rex "DPT=(?<dpt>\d+)" | rex "PROTO=(?<proto>\S+)"
-| stats count AS events earliest(_time) AS start latest(_time) AS end values(proto) AS proto_list BY src_ip dst_ip dpt
-| eval duration_s = end - start
-| where events > 100 AND duration_s > 300
-| convert ctime(start) ctime(end)
-| sort - duration_s
-| table src_ip dst_ip dpt proto_list events duration_s start end
+index=main source="/var/log/auth.log" "Failed password"
+| rex "Failed password for (?:invalid user\s)?(?<user>\S+) from (?<src_ip>\d{1,3}(?:\.\d{1,3}){3})"
+| bucket _time span=10m
+| stats dc(user) AS distinct_users count AS total_failures values(user) AS users BY src_ip _time
+| where distinct_users >= 10
+| eval alert_type="password_spraying", severity=case(distinct_users>=50,"High", distinct_users>=20,"Medium", true(),"Low")
+| table _time src_ip distinct_users total_failures users severity
 ```
 - **rex**  → extract `user` and `src_ip`
 - **bucket span = 10m**  → spray a lot slower then brute force so events will be grouped into 10 minutes windows rather than 5 from the brute force.
@@ -149,6 +148,9 @@ index=main (source="/var/log/kern.log" OR source="/var/log/syslog")
 | convert ctime(start) ctime(end)
 | sort - duration_s
 | table src_ip dst_ip dpt proto_list events duration_s start end
+| eval alert_name="Reverse Shell Detection", severity=case(duration_s>=900,"Critical", duration_s>=600,"High", duration_s>=300,"Medium")
+| collect index=main source="alert:reverse_shell"
+
 ```
 - **index=main (source=)** → search kernel, syslog and auth logs where connection and firewall events appear
 
@@ -241,23 +243,34 @@ To detect flows that transfer >= 500 MB (lab threshold) from internal host to ex
 index=main (source="/var/log/kern.log" OR source="/var/log/syslog") "UFW AUDIT" PROTO=TCP
 | rex "SRC=(?<src_ip>\d{1,3}(?:\.\d{1,3}){3})"
 | rex "DST=(?<dst_ip>\d{1,3}(?:\.\d{1,3}){3})"
-| rex "SPT=(?<src_port>\d+)" | rex "DPT=(?<dst_port>\d+)"
+| rex "SPT=(?<src_port>\d+)"
+| rex "DPT=(?<dst_port>\d+)"
 | rex "LEN=(?<len_bytes>\d+)"
 | stats count AS packets sum(len_bytes) AS total_bytes earliest(_time) AS start latest(_time) AS end BY src_ip dst_ip src_port dst_port
 | eval total_mb = round(total_bytes / (1024*1024), 2)
 | eval duration_s = end - start
-| eval src_internal = cidrmatch("192.168.64.0/24", src_ip)
-| eval dst_internal = cidrmatch("192.168.64.0/24", dst_ip)
+| eval src_internal = if(cidrmatch("192.168.64.0/24", src_ip), 1, 0)
+| eval dst_internal = if(cidrmatch("192.168.64.0/24", dst_ip), 1, 0)
 | eval direction = case(
     src_internal==1 AND dst_internal==0, "Outbound (Internal → External)",
     src_internal==0 AND dst_internal==1, "Inbound (External → Internal)",
-    1==1, "Internal/Other"
+    true(), "Internal/Other"
   )
 | where total_mb >= 500
 | eval phase = if(like(direction, "Outbound%"), "possible_exfiltration", "possible_large_transfer")
+| eval severity = case(
+    total_mb >= 10240, "Critical",
+    total_mb >= 2048,  "High",
+    total_mb >= 500,   "Medium",
+    true(),            "Low"
+  )
 | convert ctime(start) ctime(end)
-| table start end src_ip dst_ip src_port dst_port packets total_mb duration_s direction phase
+| table start end src_ip dst_ip src_port dst_port packets total_mb duration_s direction phase severity
 | sort - total_mb
+| eval alert_name="Data Exfiltration - Large Transfer"
+| eval alert_type="data_exfiltration"
+| collect index=main source="alert:data_exfiltration"
+
 ```
 
  **index=main (source=...) "UFW AUDIT"** → filters firewall and kernel logs for network traffic
@@ -342,17 +355,26 @@ This alignment between the **Splunk search results** and the **Triggered Alerts 
 Detect hosts performing horizontal or vertical port scans (many destination ports or many destination IPs in a short time window)
 
 ## SPL 
-```index=main (source="/var/log/kern.log" OR source="/var/log/syslog") "UFW AUDIT" PROTO=TCP
+```
+index=main (source="/var/log/kern.log" OR source="/var/log/syslog") "UFW AUDIT" PROTO=TCP
 | rex "SRC=(?<src_ip>\d{1,3}(?:\.\d{1,3}){3})"
 | rex "DST=(?<dst_ip>\d{1,3}(?:\.\d{1,3}){3})"
 | rex "DPT=(?<dpt>\d+)"
 | bin _time span=1m
 | stats dc(dpt) AS distinct_ports count AS events values(dpt) AS ports_by_src BY src_ip _time
 | where distinct_ports >= 20 
-| eval severity=case(distinct_ports>=100,"High", distinct_ports>=50,"Medium", 1==1,"Low")
+| eval severity=case(
+    distinct_ports>=300,"Critical",
+    distinct_ports>=150,"High",
+    distinct_ports>=50,"Medium",
+    distinct_ports>=20,"Low"
+)
 | convert ctime(_time)
 | table _time src_ip distinct_ports events severity ports_by_src
 | sort - distinct_ports
+| eval alert_name="Port Scan - Reconnaissance"
+| collect index=main source="alert:port_scan"
+
 ```
 - **index=main(source=...)** → filter kernel / syslog UFW audit lines where TCP connection attempts appear
 
