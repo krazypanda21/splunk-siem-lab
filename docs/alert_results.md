@@ -20,8 +20,16 @@ index=main source="/var/log/auth.log" "Failed password"
 | stats count AS fail_count BY src_ip, user, _time
 | where fail_count >= 10
 | sort - fail_count
-| eval alert_name="SSH Brute Force", severity=case(fail_count>=50,"Critical", fail_count>=30,"High", fail_count>=10,"Medium")
+| eval alert_type="ssh_bruteforce"
+| eval alert_name="SSH Brute Force"
+| eval severity=case(
+    fail_count>=50, "Critical",
+    fail_count>=30, "High",
+    fail_count>=10, "Medium"
+  )
+| table _time src_ip user fail_count alert_type alert_name severity
 | collect index=main source="alert:ssh_bruteforce"
+_bruteforce"
 
 ```
 
@@ -90,8 +98,15 @@ index=main source="/var/log/auth.log" "Failed password"
 | bucket _time span=10m
 | stats dc(user) AS distinct_users count AS total_failures values(user) AS users BY src_ip _time
 | where distinct_users >= 10
-| eval alert_type="password_spraying", severity=case(distinct_users>=50,"High", distinct_users>=20,"Medium", true(),"Low")
-| table _time src_ip distinct_users total_failures users severity
+| eval alert_type="password_spraying"
+| eval alert_name="Password Spraying Attack"
+| eval severity=case(
+    distinct_users>=50, "High",
+    distinct_users>=20, "Medium",
+    true(), "Low"
+  )
+| table _time src_ip distinct_users total_failures users severity alert_type alert_name
+| collect index=main source="alert:password_spraying"
 ```
 - **rex**  → extract `user` and `src_ip`
 - **bucket span = 10m**  → spray a lot slower then brute force so events will be grouped into 10 minutes windows rather than 5 from the brute force.
@@ -144,11 +159,13 @@ index=main (source="/var/log/kern.log" OR source="/var/log/syslog")
 | rex "SPT=(?<spt>\d+)" | rex "DPT=(?<dpt>\d+)" | rex "PROTO=(?<proto>\S+)"
 | stats count AS events earliest(_time) AS start latest(_time) AS end values(proto) AS proto_list BY src_ip dst_ip dpt
 | eval duration_s = end - start
-| where events > 100 AND duration_s > 300
+| where events > 300 AND duration_s > 120
 | convert ctime(start) ctime(end)
 | sort - duration_s
 | table src_ip dst_ip dpt proto_list events duration_s start end
-| eval alert_name="Reverse Shell Detection", severity=case(duration_s>=900,"Critical", duration_s>=600,"High", duration_s>=300,"Medium")
+| eval alert_name="Reverse Shell - Long Session"
+| eval alert_type="reverse_shell"
+| eval severity=case(events>=500,"High", events>=200,"Medium", events>=100,"Low")
 | collect index=main source="alert:reverse_shell"
 
 ```
@@ -165,6 +182,14 @@ index=main (source="/var/log/kern.log" OR source="/var/log/syslog")
 - **where events > 100 AND duration_s > 300** → threshold:many events and duration >= 5 minutes
 
 - **convert ctime(...) & table ...** → format timestamps and present final table.
+
+- **eval alert_name="Reverse Shell - Long Session"** - Assigns a readable name to the alert so it appears clearly in dashboards and in alert tables
+
+- **eval alert_type="reverse_shell"** - Defines the attack category used by dashboards to group and filter detections
+
+- **eval severity=case(events>=500,"High", events>=200,"Medium", events>=100,"Low")** - Automatically assigns a severity level based on event volume
+
+- **collect index=main source="alert:reverse_shell"** - Write the alert as a new event into the index, allowing splunk dashboards to visualize it as a SOC alert. 
 
 
 ## Threshold
@@ -273,23 +298,27 @@ index=main (source="/var/log/kern.log" OR source="/var/log/syslog") "UFW AUDIT" 
 
 ```
 
- **index=main (source=...) "UFW AUDIT"** → filters firewall and kernel logs for network traffic
+ - **index=main (source=...) "UFW AUDIT"** → filters firewall and kernel logs for network traffic
 
-**rex SRC/DST/SPT/DPT/Len** → extracts source / destination IPs , ports , and packet size
+ - **rex SRC/DST/SPT/DPT/Len** → extracts source / destination IPs , ports , and packet size
 
-**stats sum(len_bytes)** → totals transferred bytes per connection 
+- **stats sum(len_bytes)** → totals transferred bytes per connection 
 
-**eval total_mb** → convert bytes to megabytes
+- **eval total_mb** → convert bytes to megabytes
 
-**cidrmatch()** → identifies internal vs external IPS
+- **cidrmatch()** → identifies internal vs external IPS
 
-**case()** → labels flow as Outbound, Inbound , Internal
+- **case()** → labels flow as Outbound, Inbound , Internal
 
-**where total_mb >= 500** → filters only large transfers (>= 500 MB)
+- **where total_mb >= 500** → filters only large transfers (>= 500 MB)
 
-**eval phase** →marks events as possible_exfiltration or large_transfer
+- **eval phase** →marks events as possible_exfiltration or large_transfer
 
-**table /sort** → formats and orders final results by largest size 
+- **table /sort** → formats and orders final results by largest size 
+
+- **eval alert_type="data_exfiltration"** - Tags the alert as data exfiltration , letting dashboards group and filter this detection type 
+
+- **collect index=main source="alert:data_exfiltration"** - Stores the alert as a new event in the index with a clear source label.
 
 ## Thresholds and Severirt 
 - **Trigger:** `total_mb >= 500`
@@ -362,18 +391,20 @@ index=main (source="/var/log/kern.log" OR source="/var/log/syslog") "UFW AUDIT" 
 | rex "DPT=(?<dpt>\d+)"
 | bin _time span=1m
 | stats dc(dpt) AS distinct_ports count AS events values(dpt) AS ports_by_src BY src_ip _time
-| where distinct_ports >= 20 
+| where distinct_ports >= 20
 | eval severity=case(
-    distinct_ports>=300,"Critical",
-    distinct_ports>=150,"High",
-    distinct_ports>=50,"Medium",
-    distinct_ports>=20,"Low"
-)
-| convert ctime(_time)
-| table _time src_ip distinct_ports events severity ports_by_src
-| sort - distinct_ports
+      distinct_ports>=300,"Critical",
+      distinct_ports>=150,"High",
+      distinct_ports>=50,"Medium",
+      distinct_ports>=20,"Low"
+  )
+| eval alert_type="port_scan"
 | eval alert_name="Port Scan - Reconnaissance"
+| convert ctime(_time)
+| table _time src_ip distinct_ports events severity alert_type alert_name ports_by_src
+| sort - distinct_ports
 | collect index=main source="alert:port_scan"
+
 
 ```
 - **index=main(source=...)** → filter kernel / syslog UFW audit lines where TCP connection attempts appear
@@ -384,6 +415,13 @@ index=main (source="/var/log/kern.log" OR source="/var/log/syslog") "UFW AUDIT" 
 
 - **stats dc(dpt), count, values(dpt)** → compute number of distinct ports touched , total events, and list of ports per source_IP per window
 - **where distinct_ports >= 20 → surface only windows likely to be scanning activity
+
+- **eval alert-type="port_scan"** -
+Labels the detection as port scan, allowing dashboards to group this attack type 
+
+- **Eval alert_name="Port Scan - Reconnaissance"** - Assigns a readable alert name that appears in tables and alert views
+
+- **collect index=main source="alert:port_scan"** - Saves the detection as a new alert event in the index using a consistent source label 
 
 ## Threshold and Severity
 - **Trigger:** `distinct_ports >= 20` or `event >= 50` in a 1-minute bucket.
