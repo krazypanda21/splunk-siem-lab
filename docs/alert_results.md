@@ -29,7 +29,6 @@ index=main source="/var/log/auth.log" "Failed password"
   )
 | table _time src_ip user fail_count alert_type alert_name severity
 | collect index=main source="alert:ssh_bruteforce"
-_bruteforce"
 
 ```
 
